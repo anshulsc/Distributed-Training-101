@@ -9,19 +9,24 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 import os
 
+
 def ddp_setup():
     init_process_group(backend="nccl")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
 
 
 class Trainer:
-    def __init__(self, model: torch.nn.Module, train_data: DataLoader,
-                 optimizer: torch.optim.Optimizer,
-                 save_every: int,
-                 snapshot_path: str) -> None:
-        
-        self.gpu_id = int(os.environ["LOCAL_RANK"])
-        self.model = model.to(self.gpu_id)
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        train_data: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        save_every: int,
+        snapshot_path: str,
+    ) -> None:
+        self.local_rank = int(os.environ["LOCAL_RANK"]) # Rank of the current process within the node
+        self.global_rank = int(os.environ["RANK"]) # Rank of the current process globally
+        self.model = model.to(self.local_rank)
         self.train_data = train_data
         self.optimizer = optimizer
         self.save_every = save_every
@@ -30,15 +35,15 @@ class Trainer:
         if os.path.exists(snapshot_path):
             print("Loading snapshot")
             self._load_snapshot(snapshot_path)
-        self.model = DDP(self.model, device_ids=[self.gpu_id])
+
+        self.model = DDP(self.model, device_ids=[self.local_rank])
 
     def _load_snapshot(self, snapshot_path):
-        loc = f"cude:{self.gpu_id}"
+        loc = f"cuda:{self.local_rank}"
         snapshot = torch.load(snapshot_path, map_location=loc)
         self.model.load_state_dict(snapshot["MODEL_STATE"])
         self.epochs_run = snapshot["EPOCHS_RUN"]
         print(f"Resuming training from snapshot at Epoch {self.epochs_run}")
-
 
     def _run_batch(self, source, targets):
         self.optimizer.zero_grad()
@@ -46,16 +51,16 @@ class Trainer:
         loss = F.cross_entropy(output, targets)
         loss.backward()
         self.optimizer.step()
-    
+
     def _run_epoch(self, epoch):
         b_sz = len(next(iter(self.train_data))[0])
-        print(f"[GPU{self.gpu_id}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
+        print(f"[GPU{self.global_rank}] Epoch {epoch} | Batchsize: {b_sz} | Steps: {len(self.train_data)}")
         self.train_data.sampler.set_epoch(epoch)
         for source, targets in self.train_data:
-            source = source.to(self.gpu_id)
-            targets = targets.to(self.gpu_id)
+            source = source.to(self.local_rank)
+            targets = targets.to(self.local_rank)
             self._run_batch(source, targets)
-    
+
     def _save_snapshot(self, epoch):
         snapshot = {
             "MODEL_STATE": self.model.module.state_dict(),
@@ -63,6 +68,12 @@ class Trainer:
         }
         torch.save(snapshot, self.snapshot_path)
         print(f"Epoch {epoch} | Training snapshot saved at {self.snapshot_path}")
+
+    def train(self, max_epochs: int):
+        for epoch in range(self.epochs_run, max_epochs):
+            self._run_epoch(epoch)
+            if self.local_rank == 0 and epoch % self.save_every == 0:
+                self._save_snapshot(epoch)
 
 
 def load_train_objs():
@@ -102,6 +113,28 @@ if __name__ == "__main__":
     main(args.save_every, args.total_epochs, args.batch_size)
 
 
-    # Path: distrubuted_ref/torchrun_ddp.py
+    # Script 
 
-    # ! torchrun --standalone --nproc_per_node=gpu torchrun_ddp.py 10 2 --batch_size 32
+    # Node 1
+
+    '''
+torchrun \
+--nnodes=2 \
+--nproc_per_node=4 \
+--node_rank=0 \
+--rdzv_id=123 \
+--rdzv_backend=c10d \
+--rdzv_endpoint=IP Addesss of Head \
+multinode_torchrun.py 50 10
+    
+
+# Node 2
+torchrun \
+--nnodes=2 \
+--nproc_per_node=4 \
+--node_rank=1 \
+--rdzv_id=123 \
+--rdzv_backend=c10d \
+--rdzv_endpoint=IP Addesss of Head \
+multinode_torchrun.py 50 10
+    '''
